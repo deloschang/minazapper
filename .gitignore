@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+venv/
+data/
+models/
+training_data/
+memory/
+*.mp4
+*.wav
+*.mp3
+*.tflite
+training_data.zip
