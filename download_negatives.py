@@ -25,7 +25,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 USERNAME = os.getenv("UNIFI_USERNAME")
 PASSWORD = os.getenv("UNIFI_PASSWORD")
 
-OUTPUT_DIR = Path("training_data/negative")
+OUTPUT_DIR = Path("training_data/negative_raw")
 
 
 def login(host):
@@ -84,7 +84,8 @@ def get_events(session, host, event_type, limit=500, days_back=180):
 
 
 def download_as_wav(session, host, event, output_path):
-    """Stream video from API and pipe directly through ffmpeg to extract audio only."""
+    """Download event clip as MP4 to temp file, then extract audio."""
+    import tempfile
     camera_id = event.get("camera")
     start = event.get("start")
     end = event.get("end")
@@ -109,33 +110,27 @@ def download_as_wav(session, host, event, output_path):
     if resp.status_code != 200:
         return False
 
-    # Pipe directly through ffmpeg — no temp file
-    cmd = [
-        "ffmpeg", "-i", "pipe:0",
-        "-vn", "-acodec", "pcm_s16le",
-        "-ar", "16000", "-ac", "1",
-        "-y", str(output_path),
-    ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
         for chunk in resp.iter_content(chunk_size=8192):
-            proc.stdin.write(chunk)
-        proc.stdin.close()
-        proc.wait(timeout=30)
-        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
-            return True
-        # Clean up failed file
-        if output_path.exists():
-            output_path.unlink()
-        return False
+            tmp.write(chunk)
+
+    try:
+        if os.path.getsize(tmp_path) < 1000:
+            os.unlink(tmp_path)
+            return False
+
+        result = subprocess.run(
+            ["ffmpeg", "-i", tmp_path, "-vn", "-acodec", "pcm_s16le",
+             "-ar", "16000", "-ac", "1", "-y", str(output_path)],
+            capture_output=True, timeout=30,
+        )
+        return result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000
     except Exception:
-        proc.kill()
-        if output_path.exists():
-            output_path.unlink()
         return False
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def main():
