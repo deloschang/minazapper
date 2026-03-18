@@ -15,10 +15,13 @@ import threading
 import time
 import queue
 import os
+import urllib.request
+import urllib.parse
 from datetime import datetime
 
 import numpy as np
 import librosa
+import soundfile as sf
 
 # TFLite runtime — try ai_edge_litert first, then tflite_runtime, then tensorflow
 try:
@@ -52,6 +55,11 @@ STREAMS = {
 # Detection
 DEFAULT_THRESHOLD = 0.7
 DEFAULT_COOLDOWN = 5  # seconds between notifications
+SILENCE_TIMEOUT = 30  # seconds of silence before session ends
+
+# Pushover
+PUSHOVER_USER_KEY = "ur3xhap1zq36cwa4kkx37mzqkjtgx4"
+PUSHOVER_APP_TOKEN = "auq12e961tddxavf1yiyu8axzxith1"
 
 
 def compute_mfcc(audio):
@@ -105,6 +113,43 @@ class BarkDetector:
         return is_bark, mina_score
 
 
+class SpectralBarkDetector:
+    """Test mode detector using spectral energy analysis. No model needed."""
+
+    def __init__(self, threshold=0.5):
+        self.threshold = threshold
+        print(f"TEST MODE: Using spectral bark detection (no TFLite model)")
+        print(f"Threshold: {threshold}")
+
+    def predict(self, audio_1sec):
+        """Detect barks via spectral energy in 300-2000Hz band."""
+        if len(audio_1sec) < WINDOW_SIZE:
+            audio_1sec = np.pad(audio_1sec, (0, WINDOW_SIZE - len(audio_1sec)))
+
+        rms = np.sqrt(np.mean(audio_1sec ** 2))
+        if rms < 0.01:
+            return False, 0.0
+
+        S = np.abs(librosa.stft(audio_1sec, n_fft=1024, hop_length=256))
+        freqs = librosa.fft_frequencies(sr=SAMPLE_RATE, n_fft=1024)
+
+        bark_mask = (freqs >= 300) & (freqs <= 2000)
+        bark_energy = np.mean(S[bark_mask, :] ** 2)
+        total_energy = np.mean(S ** 2) + 1e-10
+        bark_ratio = bark_energy / total_energy
+
+        centroid = np.mean(librosa.feature.spectral_centroid(S=S, sr=SAMPLE_RATE)[0])
+        centroid_score = 1.0 if 400 < centroid < 2000 else 0.3
+
+        frame_energies = np.sum(S ** 2, axis=0)
+        impulsiveness = np.std(frame_energies) / (np.mean(frame_energies) + 1e-10)
+        impulse_score = min(impulsiveness / 2.0, 1.0)
+
+        score = min((bark_ratio * 0.5 + centroid_score * 0.25 + impulse_score * 0.25) * 1.5, 1.0)
+        is_bark = score >= self.threshold
+        return is_bark, float(score)
+
+
 class AudioStreamReader:
     """Reads audio from an RTSP stream via ffmpeg."""
 
@@ -142,7 +187,7 @@ class AudioStreamReader:
     def _read_loop(self):
         """Continuously read audio data from ffmpeg stdout."""
         while self.running and self.process.poll() is None:
-            raw = self.process.stdout.read(self.sample_rate * 2)  # 1 sec of 16-bit
+            raw = self.process.stdout.read(self.sample_rate // 4 * 2)  # 250ms of 16-bit
             if not raw:
                 time.sleep(0.1)
                 continue
@@ -177,22 +222,27 @@ class AudioStreamReader:
 
 
 def send_notification(message):
-    """Send desktop notification on Raspberry Pi."""
+    """Send notification via console, desktop, camera wall, and Pushover."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     full_msg = f"[{timestamp}] {message}"
     print(f"🔔 {full_msg}")
 
-    # Try notify-send (Linux desktop notification)
+    # Desktop dialog (zenity) — stays on screen until dismissed
     try:
+        env = os.environ.copy()
+        env["DISPLAY"] = ":0"
         subprocess.Popen(
-            ["notify-send", "-u", "critical", "-t", "5000",
-             "🐕 Mina Bark Detected!", message],
+            ["zenity", "--warning", "--no-wrap",
+             "--title=Mina Bark Detected",
+             f"--text=[{timestamp}] {message}",
+             "--width=400"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
         )
     except FileNotFoundError:
         pass
 
-    # Also write to a JSON file the camera-wall can poll
+    # Camera wall JSON overlay
     import json
     notification = {
         "type": "bark",
@@ -205,6 +255,20 @@ def send_notification(message):
     except Exception:
         pass
 
+    # Pushover (silent notification)
+    try:
+        data = urllib.parse.urlencode({
+            "token": PUSHOVER_APP_TOKEN,
+            "user": PUSHOVER_USER_KEY,
+            "message": message,
+            "title": "Mina Bark Detected",
+            "priority": -1,  # silent / no sound
+        }).encode()
+        req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"  Pushover error: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Real-time bark detector")
@@ -213,10 +277,17 @@ def main():
     parser.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN,
                         help=f"Seconds between notifications (default: {DEFAULT_COOLDOWN})")
     parser.add_argument("--model", default=MODEL_PATH, help="Path to .tflite model")
+    parser.add_argument("--test", action="store_true",
+                        help="Test mode: use spectral detection instead of TFLite model")
+    parser.add_argument("--silence", type=float, default=SILENCE_TIMEOUT,
+                        help=f"Seconds of silence before session ends (default: {SILENCE_TIMEOUT})")
     args = parser.parse_args()
 
-    # Load model
-    detector = BarkDetector(args.model, threshold=args.threshold)
+    # Load detector
+    if args.test:
+        detector = SpectralBarkDetector(threshold=args.threshold)
+    else:
+        detector = BarkDetector(args.model, threshold=args.threshold)
 
     # Start audio streams
     streams = {}
@@ -225,11 +296,21 @@ def main():
         reader.start()
         streams[name] = reader
 
-    print(f"\nListening for barks (threshold={args.threshold}, cooldown={args.cooldown}s)...")
+    print(f"\nListening for barks (threshold={args.threshold}, silence={args.silence}s)...")
     print("Press Ctrl+C to stop.\n")
 
-    last_notification_time = 0
-    detection_window = {}  # camera -> last detection time
+    # Session tracking
+    in_session = False
+    session_start = 0
+    session_last_bark = 0
+    session_detections = 0
+    session_cameras = set()
+    session_max_conf = 0
+    session_id_counter = 0
+
+    # Save detection clips for review/retraining
+    clips_dir = os.path.expanduser("~/minazap/detection_clips")
+    os.makedirs(clips_dir, exist_ok=True)
 
     try:
         while True:
@@ -243,30 +324,55 @@ def main():
                 is_bark, confidence = detector.predict(window)
 
                 if is_bark:
-                    detections.append((name, confidence))
-                    detection_window[name] = time.time()
+                    detections.append((name, confidence, window))
+
+            now = time.time()
 
             if detections:
-                now = time.time()
+                cameras = [d[0] for d in detections]
+                max_conf = max(d[1] for d in detections)
 
-                # Deduplicate: if multiple cameras detect within 1 second,
-                # count as a single bark event
-                recent = [
-                    (name, t) for name, t in detection_window.items()
-                    if now - t < 1.0
-                ]
+                if not in_session:
+                    # New bark session
+                    in_session = True
+                    session_start = now
+                    session_detections = 0
+                    session_cameras = set()
+                    session_max_conf = 0
+                    session_id_counter += 1
+                    session_id = f"S{session_id_counter:03d}"
 
-                if now - last_notification_time >= args.cooldown:
-                    cameras = [d[0] for d in detections]
-                    max_conf = max(d[1] for d in detections)
                     cam_str = ", ".join(cameras)
-
-                    msg = f"Bark detected on {cam_str} ({max_conf:.0%} confidence)"
+                    msg = f"[{session_id}] Barking started on {cam_str} ({max_conf:.0%} confidence)"
                     send_notification(msg)
-                    last_notification_time = now
 
-            # Run inference every 500ms (50% overlap)
-            time.sleep(0.5)
+                # Save detection clip tagged with session ID
+                for cam_name, conf, audio_window in detections:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    clip_path = os.path.join(clips_dir, f"{session_id}_{ts}_{cam_name}_{conf:.0%}.wav")
+                    try:
+                        sf.write(clip_path, audio_window, SAMPLE_RATE)
+                    except Exception:
+                        pass
+
+                # Update session stats
+                session_last_bark = now
+                session_detections += 1
+                session_cameras.update(cameras)
+                session_max_conf = max(session_max_conf, max_conf)
+
+            elif in_session and (now - session_last_bark) >= args.silence:
+                # Silence timeout — session ended, send summary
+                duration = session_last_bark - session_start
+                cam_str = ", ".join(sorted(session_cameras))
+                msg = (f"[{session_id}] Barking stopped. Duration: {duration:.0f}s, "
+                       f"cameras: {cam_str}, "
+                       f"peak confidence: {session_max_conf:.0%}")
+                send_notification(msg)
+                in_session = False
+
+            # Run inference every 250ms for faster response
+            time.sleep(0.25)
 
     except KeyboardInterrupt:
         print("\nStopping...")
