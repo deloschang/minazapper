@@ -1,0 +1,17 @@
+[Unit]
+Description=Mina Bark Detector
+After=network.target go2rtc.service
+Wants=go2rtc.service
+
+[Service]
+User=del
+Environment=DISPLAY=:0
+WorkingDirectory=/home/del/minazap
+ExecStart=/home/del/minazap-env/bin/python -u /home/del/minazap/bark_detector.py --threshold 0.85 --silence 30
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/del/minazap/detector.log
+StandardError=append:/home/del/minazap/detector.log
+
+[Install]
+WantedBy=multi-user.target

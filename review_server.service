@@ -1,0 +1,15 @@
+[Unit]
+Description=Mina Clip Review Server
+After=network.target
+
+[Service]
+User=del
+WorkingDirectory=/home/del/minazap
+ExecStart=/home/del/minazap-env/bin/python -u /home/del/minazap/review_server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/del/minazap/review_server.log
+StandardError=append:/home/del/minazap/review_server.log
+
+[Install]
+WantedBy=multi-user.target

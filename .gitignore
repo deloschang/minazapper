@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 venv/
+venv-arm64/
 data/
 models/
 training_data/
@@ -11,3 +12,14 @@ memory/
 *.mp3
 *.tflite
 training_data.zip
+.claude/
+backups/
+logs/
+false_positives/
+clips_cache.json
+rms_cache.json
+unifi_bark_cache.json
+manual_labels.json
+manual_labels_training.json
+.labels_checkpoint
+.last_deploy_snapshot.json

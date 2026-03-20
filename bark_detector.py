@@ -57,9 +57,10 @@ DEFAULT_THRESHOLD = 0.7
 DEFAULT_COOLDOWN = 5  # seconds between notifications
 SILENCE_TIMEOUT = 30  # seconds of silence before session ends
 
-# Pushover
-PUSHOVER_USER_KEY = "ur3xhap1zq36cwa4kkx37mzqkjtgx4"
-PUSHOVER_APP_TOKEN = "auq12e961tddxavf1yiyu8axzxith1"
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 def compute_mfcc(audio):
@@ -153,6 +154,9 @@ class SpectralBarkDetector:
 class AudioStreamReader:
     """Reads audio from an RTSP stream via ffmpeg."""
 
+    MAX_BACKOFF = 120  # Max seconds between retries
+    BACKOFF_RESET_AFTER = 300  # Reset backoff after 5 min of stable streaming
+
     def __init__(self, name, url, sample_rate=16000):
         self.name = name
         self.url = url
@@ -161,9 +165,15 @@ class AudioStreamReader:
         self.running = False
         self.buffer = np.array([], dtype=np.float32)
         self.lock = threading.Lock()
+        self._backoff = 2
+        self._last_success = 0
+        self._healthy = False
+        self._new_data = False  # Set when new audio arrives
+        self._new_samples = 0  # Count of new samples since last get_window
 
     def start(self):
         """Start ffmpeg process to read audio from RTSP stream."""
+        self._cleanup()
         self.running = True
         cmd = [
             "ffmpeg",
@@ -184,13 +194,37 @@ class AudioStreamReader:
         self.thread.start()
         print(f"[{self.name}] Stream started")
 
+    def _cleanup(self):
+        """Kill any existing ffmpeg process."""
+        if self.process:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            except Exception:
+                pass
+            self.process = None
+
     def _read_loop(self):
         """Continuously read audio data from ffmpeg stdout."""
+        self._last_success = time.time()
+        self._healthy = False
+
         while self.running and self.process.poll() is None:
-            raw = self.process.stdout.read(self.sample_rate // 4 * 2)  # 250ms of 16-bit
+            # Read 64ms chunks (1024 samples * 2 bytes) for low latency
+            raw = self.process.stdout.read(1024 * 2)
             if not raw:
                 time.sleep(0.1)
                 continue
+
+            # Stream is delivering data — mark healthy
+            if not self._healthy:
+                self._healthy = True
+                self._last_success = time.time()
+
+            # Reset backoff after sustained healthy streaming
+            if time.time() - self._last_success > self.BACKOFF_RESET_AFTER:
+                self._backoff = 2
+                self._last_success = time.time()
 
             # Convert raw PCM bytes to float32 normalized
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
@@ -201,46 +235,41 @@ class AudioStreamReader:
                 max_buf = self.sample_rate * 2
                 if len(self.buffer) > max_buf:
                     self.buffer = self.buffer[-max_buf:]
+                self._new_samples += len(samples)
+                # Flag new data after ~62ms of new audio (1000 samples at 16kHz)
+                if self._new_samples >= 1000:
+                    self._new_data = True
 
         if self.running:
-            print(f"[{self.name}] Stream ended unexpectedly, restarting...")
-            time.sleep(2)
+            self._cleanup()
+            print(f"[{self.name}] Stream ended unexpectedly, retrying in {self._backoff}s...")
+            time.sleep(self._backoff)
+            self._backoff = min(self._backoff * 2, self.MAX_BACKOFF)
             self.start()
 
     def get_window(self):
-        """Get the latest 1-second window. Returns None if not enough data."""
+        """Get the latest 1-second window. Returns None if no new data or not enough data."""
         with self.lock:
-            if len(self.buffer) < self.sample_rate:
+            if not self._new_data or len(self.buffer) < self.sample_rate:
                 return None
+            self._new_data = False
+            self._new_samples = 0
             window = self.buffer[-self.sample_rate:].copy()
         return window
 
     def stop(self):
         self.running = False
-        if self.process:
-            self.process.kill()
+        self._cleanup()
 
 
-def send_notification(message):
+REVIEW_URL_BASE = "http://192.168.1.68:8086/review"
+
+
+def send_notification(message, session_id=None):
     """Send notification via console, desktop, camera wall, and Pushover."""
     timestamp = datetime.now().strftime("%H:%M:%S")
     full_msg = f"[{timestamp}] {message}"
     print(f"🔔 {full_msg}")
-
-    # Desktop dialog (zenity) — stays on screen until dismissed
-    try:
-        env = os.environ.copy()
-        env["DISPLAY"] = ":0"
-        subprocess.Popen(
-            ["zenity", "--warning", "--no-wrap",
-             "--title=Mina Bark Detected",
-             f"--text=[{timestamp}] {message}",
-             "--width=400"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
-    except FileNotFoundError:
-        pass
 
     # Camera wall JSON overlay
     import json
@@ -255,19 +284,25 @@ def send_notification(message):
     except Exception:
         pass
 
-    # Pushover (silent notification)
-    try:
-        data = urllib.parse.urlencode({
-            "token": PUSHOVER_APP_TOKEN,
-            "user": PUSHOVER_USER_KEY,
-            "message": message,
-            "title": "Mina Bark Detected",
-            "priority": -1,  # silent / no sound
-        }).encode()
-        req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        print(f"  Pushover error: {e}")
+    # Telegram (async, non-blocking)
+    def _send_telegram():
+        try:
+            # Strip HTML tags for Telegram text, add review link
+            import re as _re
+            clean_msg = _re.sub(r"<[^>]+>", "", message)
+            if session_id:
+                clean_msg += f"\n\nReview: {REVIEW_URL_BASE}/{session_id}"
+            data = urllib.parse.urlencode({
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": clean_msg,
+            }).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data=data)
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"  Telegram error: {e}")
+    threading.Thread(target=_send_telegram, daemon=True).start()
+
 
 
 def main():
@@ -306,31 +341,87 @@ def main():
     session_detections = 0
     session_cameras = set()
     session_max_conf = 0
-    session_id_counter = 0
-
     # Save detection clips for review/retraining
     clips_dir = os.path.expanduser("~/minazap/detection_clips")
     os.makedirs(clips_dir, exist_ok=True)
 
+    # Persist session counter across restarts
+    counter_file = os.path.expanduser("~/minazap/session_counter.txt")
+    try:
+        with open(counter_file) as f:
+            session_id_counter = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        session_id_counter = 0
+
+    last_heartbeat = time.time()
+    HEARTBEAT_INTERVAL = 3600  # 1 hour
+    last_health_check = time.time()
+    HEALTH_CHECK_INTERVAL = 120  # check every 2 min
+    stream_down_notified = set()  # avoid repeat alerts
+
     try:
         while True:
+            now = time.time()
+
+            # Stream health check
+            if now - last_health_check >= HEALTH_CHECK_INTERVAL:
+                last_health_check = now
+                for name, reader in streams.items():
+                    if not reader._healthy and name not in stream_down_notified:
+                        stream_down_notified.add(name)
+                        send_notification(f"⚠️ Stream '{name}' is down — attempting reconnect")
+                        print(f"[{name}] Stream unhealthy, restarting...")
+                        reader.stop()
+                        reader.start()
+                    elif reader._healthy and name in stream_down_notified:
+                        stream_down_notified.discard(name)
+                        send_notification(f"✅ Stream '{name}' recovered")
+
+            # Hourly heartbeat
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                last_heartbeat = now
+                stream_status = ", ".join(
+                    f"{n}: {'ok' if r._healthy else 'down'}" for n, r in streams.items()
+                )
+                clip_count = len([f for f in os.listdir(clips_dir) if f.endswith(".wav")])
+                msg = (f"Heartbeat — uptime {int((now - last_heartbeat + HEARTBEAT_INTERVAL) // 3600)}h, "
+                       f"streams: {stream_status}, "
+                       f"clips: {clip_count}, "
+                       f"sessions: {session_id_counter}")
+                send_notification(msg)
+
             detections = []
+            t_loop = time.time()
 
             for name, reader in streams.items():
-                window = reader.get_window()
+                try:
+                    window = reader.get_window()
+                except Exception:
+                    continue
                 if window is None:
                     continue
 
-                is_bark, confidence = detector.predict(window)
+                # Skip quiet audio — real barks have significant energy
+                rms = float(np.sqrt(np.mean(window ** 2)))
+                if rms < 0.007:
+                    continue
+
+                try:
+                    t_inf = time.time()
+                    is_bark, confidence = detector.predict(window)
+                    inf_ms = (time.time() - t_inf) * 1000
+                except Exception:
+                    continue
 
                 if is_bark:
-                    detections.append((name, confidence, window))
-
-            now = time.time()
+                    detections.append((name, confidence, window, inf_ms))
 
             if detections:
                 cameras = [d[0] for d in detections]
                 max_conf = max(d[1] for d in detections)
+                max_inf_ms = max(d[3] for d in detections)
+                loop_ms = (time.time() - t_loop) * 1000
+                print(f"  [{cameras[0]}] inference: {max_inf_ms:.1f}ms, loop: {loop_ms:.1f}ms")
 
                 if not in_session:
                     # New bark session
@@ -341,15 +432,36 @@ def main():
                     session_max_conf = 0
                     session_id_counter += 1
                     session_id = f"S{session_id_counter:03d}"
+                    with open(counter_file, "w") as f:
+                        f.write(str(session_id_counter))
 
                     cam_str = ", ".join(cameras)
-                    msg = f"[{session_id}] Barking started on {cam_str} ({max_conf:.0%} confidence)"
-                    send_notification(msg)
+                    review_url = f"{REVIEW_URL_BASE}/{session_id}"
+                    msg = (f"[{session_id}] Barking started on {cam_str} ({max_conf:.0%} confidence)\n"
+                           f"<a href=\"{review_url}\">Review & Label</a>")
+                    send_notification(msg, session_id=session_id)
 
-                # Save detection clip tagged with session ID
-                for cam_name, conf, audio_window in detections:
+                # Save one clip per camera per second (avoid overlapping duplicates)
+                for cam_name, conf, audio_window, _ in detections:
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    clip_path = os.path.join(clips_dir, f"{session_id}_{ts}_{cam_name}_{conf:.0%}.wav")
+                    clip_key = f"{session_id}_{ts}_{cam_name}"
+                    last_key = f"_last_save_{cam_name}"
+                    if getattr(detector, last_key, None) == clip_key:
+                        continue  # Already saved this camera+second
+                    setattr(detector, last_key, clip_key)
+
+                    # Skip quiet/garbled audio — real barks have rms > 0.01
+                    rms = float(np.sqrt(np.mean(audio_window ** 2)))
+                    if rms < 0.007:
+                        continue
+                    fft_mag = np.abs(np.fft.rfft(audio_window))[1:]
+                    geo = float(np.exp(np.mean(np.log(fft_mag + 1e-10))))
+                    arith = float(np.mean(fft_mag))
+                    flatness = geo / (arith + 1e-10)
+                    if (rms < 0.005 and flatness > 0.45) or flatness > 0.65:
+                        continue
+
+                    clip_path = os.path.join(clips_dir, f"{clip_key}_{conf:.0%}.wav")
                     try:
                         sf.write(clip_path, audio_window, SAMPLE_RATE)
                     except Exception:
@@ -365,17 +477,24 @@ def main():
                 # Silence timeout — session ended, send summary
                 duration = session_last_bark - session_start
                 cam_str = ", ".join(sorted(session_cameras))
+                review_url = f"{REVIEW_URL_BASE}/{session_id}"
                 msg = (f"[{session_id}] Barking stopped. Duration: {duration:.0f}s, "
                        f"cameras: {cam_str}, "
-                       f"peak confidence: {session_max_conf:.0%}")
-                send_notification(msg)
+                       f"peak confidence: {session_max_conf:.0%}\n"
+                       f"<a href=\"{review_url}\">Review & Label</a>")
+                send_notification(msg, session_id=session_id)
                 in_session = False
 
-            # Run inference every 250ms for faster response
-            time.sleep(0.25)
+            # Poll fast, inference gated by 250ms new audio per stream
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\nStopping...")
+    except Exception as e:
+        # Log crash but let systemd restart us
+        print(f"FATAL: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         for reader in streams.values():
             reader.stop()
